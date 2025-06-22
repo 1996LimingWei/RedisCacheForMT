@@ -1,0 +1,6 @@
+- task: BatchScript@1
+  displayName: RunEvalFile
+  inputs:
+    filename: '$(System.DefaultWorkingDirectory)/_GenderDebias-PullRequest/drop_linux_stage_linux_job/PerformanceEvaluation/GenderDebias.PerformanceEvaluation.dll'
+    arguments: 'prod Output "$(System.DefaultWorkingDirectory)/_GenderDebias-PullRequest/drop_linux_stage_linux_job/test_sets" -1 '
+
