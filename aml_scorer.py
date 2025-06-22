@@ -18,8 +18,7 @@ from opencensus.stats import measure as measure_module
 from opencensus.stats import stats as stats_module
 from opencensus.stats import view as view_module
 from opencensus.tags import tag_map as tag_map_module
-import json
-from redis_cache import RedisCache
+from redis_cache import *
 
 word_re = re.compile('\\w+', re.UNICODE)
 script_dir = os.path.dirname(__file__) #<-- absolute dir the script is in
@@ -54,8 +53,7 @@ requests_view = view_module.View("requests view",
 reinflections_view_measurement_map = stats_recorder.new_measurement_map()
 requests_view_measurement_map = stats_recorder.new_measurement_map()
 redis_connect = None
-cache_flag = "false"
-local_deployment_flag = "false"
+
 def get_hostname_cpu():
     cpu_type_command = "cat /proc/cpuinfo"
     cpu_all_info = subprocess.check_output(cpu_type_command, shell=True).decode().strip()
@@ -64,9 +62,6 @@ def get_hostname_cpu():
 
 def init():
     global redis_connect
-    global cache_flag
-    global local_deployment_flag
-    global redis_cache
     # Make sure the model version is in sync with gender_debias_pipeline/AML-config/blue-deployment-azure.yml
     model_path = os.path.join(os.getenv("AZUREML_MODEL_DIR"), "modelfiles")
     config_path = os.path.join(model_path, "default_config.json")
@@ -76,8 +71,8 @@ def init():
     logging_config = load_json_file(log_path)
 
     global app_logger
-    local_deployment_flag = os.getenv("LOCAL_DEPLOYMENT").lower()
-    if local_deployment_flag == "true":
+
+    if os.getenv("LOCAL_DEPLOYMENT").lower() == "true":
         app_logger = get_disabled_logger()
     else:
         app_insights_instrumentation_key = os.getenv("AML_APP_INSIGHTS_KEY")
@@ -90,11 +85,8 @@ def init():
     global tracer
     # tracer = app_logger.get_tracer(component_name=component_name)
     tracer = None
-    cache_flag = os.getenv("Enable_Cache").lower()
-    if cache_flag == "true":
-        cache_options = CacheOptions()
-        redis_cache = RedisCache(cache_options)
-        redis_connect = redis_cache.get_redis_connection()
+    if os.getenv("LOCAL_DEPLOYMENT").lower() == "false":
+        redis_connect = get_redis_connection()
 
     logger.info('########## INIT Starting ########## v:4-07-2022 5:30PM')
     now = datetime.now()
@@ -154,6 +146,7 @@ def run(data):
 
         request_logger.info(f'########## SCORE START ##########')
         now = datetime.now()
+        request_logger.info(f"TIME: {now}")
         request_logger.info(f"Instance ID = {instance_id}, Machine info: {machine_info}")
 
         # validate and serialize request to aml_request object
@@ -176,11 +169,123 @@ def run(data):
             else:
                 request_logger.info((f'Matched sentfix but log input disabled'))
             return AMLResponse(api_response, 200, aml_request.response_headers)
-        cache_log_flag = os.getenv("Cache_Debug").lower()
-        #Cache Entry 
-        updated_cached_response_str, get_latency, cache_key, source_fast_words, orig_tgt_fast_words, space_norm_source, space_norm_orig_tgt = redis_cache.try_get_entry_from_cache(aml_request, redis_connect, trace_id, cache_flag)
-        if updated_cached_response_str and cache_log_flag.lower() == "true":
-            logger.info(f"get data in cache completed, latency is: {get_latency:.2f} milliseconds, text: {aml_request.src_text}")
-            return AMLResponse(updated_cached_response_str, 200, aml_request.response_headers)
+        #Cache Entry
+        if os.getenv("LOCAL_DEPLOYMENT").lower() == "false":
+            src_lang_str = str(aml_request.src_lang)
+            tgt_lang_str = str(aml_request.tgt_lang)
+            cache_key = GenerateCacheKey(src_lang_str, tgt_lang_str, aml_request.src_text, aml_request.tgt_text)
+            cache_log_flag = os.getenv("Cache_Debug")
+            if redis_connect is not None:
+                cached_response, get_latency = get_data_from_cache(redis_connect, cache_key)
+                if cached_response:
+                    if cache_log_flag.lower() == "true":
+                        logger.info("Retrieved response from cache, latency is: %.2f milliseconds" % get_latency)
+                        cached_response_obj = json.loads(cached_response)
+                        cached_response_obj["src_sentence"] = aml_request.src_text
+                        cached_response_obj["tgt"] = tgt_dict
+                        updated_cached_response = get_json(cached_response_obj)
+                        return AMLResponse(updated_cached_response, 200, aml_request.response_headers)
+        start_time = datetime.now()
+        # with tracer.span(name='Debias_Models.get_reinflection_single_sentence'):
+        reinflection_result = model.get_reinflection_single_sentence(aml_request.src_text, aml_request.tgt_text, verbose=True, max_words=aml_request.options.max_words, max_hypotheses=aml_request.options.max_hypotheses, request_logger=request_logger)
+        
+        request_logger.info(f"reinflection complete. Time taken = {datetime.now() - start_time}")
+        request_logger.info(f'########## SCORE END ##########')
+        now = datetime.now()
+        request_logger.info(f"TIME: {now}")
+        has_reinflection = False
 
-At this line:         updated_cached_response_str, get_latency, cache_key, source_fast_words, orig_tgt_fast_words, space_norm_source, space_norm_orig_tgt = redis_cache.try_get_entry_from_cache(aml_request, redis_connect, trace_id, cache_flag)
+        test_request = False    
+        #check is the header contains the string API-TEST and if so don't track it.
+        if "API-TEST" in aml_request.response_headers[client_traceid_response_header_name]:
+            test_request = True
+        
+        if not test_request:
+            tmap_request = tag_map_module.TagMap()
+            tmap_request.insert("srcLanguage", aml_request.src_lang.value)
+            tmap_request.insert("tgtLanguage", aml_request.tgt_lang.value)
+            requests_view_measurement_map.measure_int_put(number_of_requests_measure, 1)
+            requests_view_measurement_map.record(tmap_request)
+
+        if not reinflection_result.has_reinflection():
+            # reinflection was aborted for some reason
+            logger.debug (f"No reinflection. Reason = {reinflection_result.aborted_reason} ({trace_id})")
+            tgt_dict = {str(ApiGender.Neutral) : aml_request.tgt_text}
+        else:
+            if not test_request:
+                tmap_reinflections = tag_map_module.TagMap()
+                tmap_reinflections.insert("srcLanguage", aml_request.src_lang.value)
+                tmap_reinflections.insert("tgtLanguage", aml_request.tgt_lang.value)
+                reinflections_view_measurement_map.measure_int_put(number_of_reinflections_measure, 1)
+                reinflections_view_measurement_map.record(tmap_reinflections)
+
+            has_reinflection = True
+            best_hyp_gender = reinflection_result.get_best_hyp_gender()
+            best_hyp = reinflection_result.get_best_hyp()
+            if best_hyp_gender == Gender.Ambiguous:
+                request_logger.debug(f"gender of the hypothesis was not clear, assuming orig_tgt is Masculine and reinflection is Feminine ({trace_id})")
+
+            masc_tgt = best_hyp             if best_hyp_gender == Gender.Male else aml_request.tgt_text
+            fem_tgt  = aml_request.tgt_text if best_hyp_gender == Gender.Male else best_hyp
+            
+            tgt_dict = {
+                str(ApiGender.Feminine): fem_tgt,
+                str(ApiGender.Masculine): masc_tgt,
+            }
+
+        result = GenderDebiasResponse(aml_request.src_text, tgt_dict)
+        if(aml_request.options.debug):
+            result =  GenderDebiasDebugResponse(aml_request.src_text, tgt_dict, reinflection_result.debug_options())
+        api_response = get_json(result)
+
+        if log_input:
+            request_logger.info(f"has_reinflection={has_reinflection}, Api_response={api_response}")
+
+        # Set in Cache
+        if os.getenv("LOCAL_DEPLOYMENT").lower() == "false":
+            if cached_response is None:
+                tgt_part_str = str(tgt_dict)
+                set_latency = set_data_in_cache(redis_connect, cache_key, tgt_part_str, os.getenv("Cache_expiration_time"))
+                if cache_log_flag == "true": 
+                    logger.info("Set request response to cache with expiration time, latency is: %.2f milliseconds" % set_latency)
+        return AMLResponse(api_response, 200, aml_request.response_headers)
+    except Exception as e:
+        error_code = 50000
+        request_logger.info(f"Unexpected exception {traceback.format_exc()}. Errorcode:{error_code}")
+        api_response = get_json(GenderDebiasErrorResponse(error_code, "Internal Server Error"))
+        return AMLResponse(api_response, 500, aml_request.response_headers)
+
+def try_match_sentfix(sentfix_manager, src, orig_tgt):
+        sentfix_result = sentfix_manager.try_match_sentfix(src)
+        if sentfix_result is None:
+            return None
+        
+        if sentfix_result.is_neutral():
+            tgt = {str(ApiGender.Neutral): sentfix_result.fem_trans} # fem and masc translations are equivalent
+        elif sentfix_result.is_orig_passthrough():
+            tgt = {str(ApiGender.Neutral): orig_tgt}                 # indicates we should not reinflect, just use MT output
+        else:
+            tgt =  {
+                        str(ApiGender.Feminine): sentfix_result.fem_trans,
+                        str(ApiGender.Masculine): sentfix_result.masc_trans
+                   }
+
+        return GenderDebiasResponse(src, tgt)
+
+def local_web_service_testing():
+    init()
+    data = """{
+                "source": {
+                    "language": "en",
+                    "text": "The cook is making dinner."
+                },
+                "target": {
+                    "language": "es",
+                    "text": "El cocinero está preparando la cena."
+                }
+            }"""
+    response = run(data)
+    print(f'response={response}')
+
+if __name__ == "__main__":
+    local_web_service_testing()
